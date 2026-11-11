@@ -5,7 +5,9 @@ import { TOPIC_KEYS, type ChartData, type TopicKey } from "@/lib/chart-summary";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const MODEL = "gemini-2.0-flash";
+const MODEL = "gemini-1.5-pro";
+const FALLBACK_MODEL = "gemini-1.5-flash";
+const RETRY_ERROR = "Interpretation service busy. Please click Try Again.";
 const MAX_PAYLOAD_CHARS = 30_000;
 const MAX_PAYLOAD_BYTES = 30_000;
 const MAX_PLANETS = 32;
@@ -70,6 +72,24 @@ function responseSchema(): Schema {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (!isRecord(error)) return undefined;
+  const nestedError = isRecord(error.error) ? error.error : undefined;
+  const status = error.status ?? error.code ?? nestedError?.code;
+  const numericStatus = typeof status === "string" ? Number(status) : status;
+  return typeof numericStatus === "number" && Number.isFinite(numericStatus) ? numericStatus : undefined;
+}
+
+function isRateLimitError(error: unknown): boolean {
+  if (getErrorStatus(error) === 429) return true;
+  if (!isRecord(error)) return false;
+  const nestedError = isRecord(error.error) ? error.error : undefined;
+  const message = [error.message, nestedError?.message]
+    .filter((part): part is string => typeof part === "string")
+    .join(" ");
+  return /rate.?limit|too many requests|resource exhausted|quota exceeded/i.test(message);
 }
 
 function isText(value: unknown, maxLength = 200): value is string {
@@ -196,53 +216,48 @@ export async function POST(request: NextRequest) {
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: [
-          "You are a careful astrologer and editorial writer.",
-          BRAND_VOICE,
-          ACCURACY_RULES,
-          vedic ? VEDIC_RULES : WESTERN_RULES,
-          `Topic guidance:\n${Object.values(TOPIC_PROMPTS).join("\n")}`,
-          "Return only JSON matching the provided schema.",
-        ].join("\n"),
-        responseMimeType: "application/json",
-        responseSchema: responseSchema(),
-        temperature: 0.7,
-        maxOutputTokens: 8192,
-      },
-    });
+    const config = {
+      systemInstruction: [
+        "You are a careful astrologer and editorial writer.",
+        BRAND_VOICE,
+        ACCURACY_RULES,
+        vedic ? VEDIC_RULES : WESTERN_RULES,
+        `Topic guidance:\n${Object.values(TOPIC_PROMPTS).join("\n")}`,
+        "Return only JSON matching the provided schema.",
+      ].join("\n"),
+      responseMimeType: "application/json",
+      responseSchema: responseSchema(),
+      temperature: 0.7,
+      maxOutputTokens: 8192,
+    };
+
+    let response;
+    try {
+      response = await ai.models.generateContent({ model: MODEL, contents: prompt, config });
+    } catch (error) {
+      if (!isRateLimitError(error)) throw error;
+      console.warn(`[summarize] ${MODEL} rate limited; retrying with ${FALLBACK_MODEL}.`);
+      response = await ai.models.generateContent({ model: FALLBACK_MODEL, contents: prompt, config });
+    }
 
     const text = response.text;
     if (!text) {
-      return NextResponse.json({ error: "The reading returned no content. Please try again." }, { status: 502 });
+      return NextResponse.json({ error: RETRY_ERROR }, { status: 503 });
     }
 
     let result: unknown;
     try {
       result = JSON.parse(text);
     } catch {
-      return NextResponse.json({ error: "The reading could not be processed. Please try again." }, { status: 502 });
+      return NextResponse.json({ error: RETRY_ERROR }, { status: 503 });
     }
     if (!isValidSummary(result)) {
-      return NextResponse.json({ error: "The reading was incomplete. Please try again." }, { status: 502 });
+      return NextResponse.json({ error: RETRY_ERROR }, { status: 503 });
     }
     return NextResponse.json({ system: chart.system, summary: result });
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
     console.error("[summarize] Gemini request failed:", message);
-    const status = isRecord(error) ? error.status ?? (isRecord(error.error) ? error.error.code : undefined) : undefined;
-    if (status === 429) {
-      return NextResponse.json({ error: "Gemini is busy. Please wait a moment and retry." }, { status: 429 });
-    }
-    if (status === 503 || status === 504) {
-      return NextResponse.json({ error: "The reading service is temporarily busy. Please retry in a moment." }, { status: 503 });
-    }
-    if (status === 404) {
-      return NextResponse.json({ error: "The configured Gemini model is unavailable for this API key." }, { status: 503 });
-    }
-    return NextResponse.json({ error: "The reading service is temporarily unavailable. Please try again." }, { status: 502 });
+    return NextResponse.json({ error: RETRY_ERROR }, { status: 503 });
   }
 }
